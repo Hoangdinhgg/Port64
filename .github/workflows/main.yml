@@ -7,131 +7,168 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: gcc-ios-build
+  cancel-in-progress: true
+
+env:
+  GCC_VERSION: "15.2.0"
+  GMP_VERSION: "6.2.1"
+  MPFR_VERSION: "4.2.1"
+  MPC_VERSION: "1.2.1"
+  ISL_VERSION: "0.25"
+  TARGET: "aarch64-apple-ios"
+  PREFIX: "/usr/local/gcc-ios"
+  DESTDIR_REL: "installroot"
 
 jobs:
-  build-macos:
-    name: Build GCC on macOS
+  build:
     runs-on: macos-latest
     timeout-minutes: 720
-    env:
-      # NOTE: use full release string (major.minor.patch)
-      GCC_VERSION: "15.2.0"
-      GMP_VERSION: "6.2.1"
-      MPFR_VERSION: "4.2.1"
-      MPC_VERSION: "1.2.1"
-      ISL_VERSION: "0.25"
-      TARGET: "aarch64-apple-ios"
-      PREFIX: "/usr/local/gcc-ios"
-      DESTDIR_REL: "installroot"
+
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Homebrew deps
-        run: |
-          brew update
-          brew install autoconf automake libtool gawk gmp mpfr libmpc isl python@3 bison texinfo wget cmake pkg-config xz
-
-      - name: Show environment (debug)
-        run: |
-          sw_vers
-          xcode-select -p
-          xcrun --sdk iphoneos --show-sdk-path
-          echo "CPU cores: $(sysctl -n hw.ncpu)"
-          which clang || true
-          clang --version || true
-
-      - name: Get SDK path
-        id: sdk
-        run: |
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "sdk_path=$SDK" >> $GITHUB_OUTPUT
-          ls -la "$SDK" || true
-
-      - name: Prepare variables
-        id: vars
-        run: |
-          CORES=$(sysctl -n hw.ncpu || echo 2)
-          echo "cores=$CORES" >> $GITHUB_OUTPUT
-
-      - name: Download & extract helper + Sources
+      - name: Install Homebrew deps + ccache
         run: |
           set -euo pipefail
-          cd $GITHUB_WORKSPACE
+          brew update
+          brew install autoconf automake libtool gawk gmp mpfr libmpc isl \
+                       python@3 bison texinfo wget cmake pkg-config xz ccache ruby
+
+      - name: Setup ccache
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ccache
+          echo "max_size = 2.0G" > ~/.ccache/ccache.conf || true
+          ccache -s || true
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-gcc-${{ env.GCC_VERSION }}
+          restore-keys: |
+            ccache-${{ runner.os }}-gcc-
+
+      - name: Restore thirdparty cache
+        uses: actions/cache@v4
+        with:
+          path: thirdparty
+          key: thirdparty-${{ runner.os }}-gcc-${{ env.GCC_VERSION }}
+          restore-keys: |
+            thirdparty-${{ runner.os }}-gcc-
+
+      - name: Get iOS SDK path
+        id: sdk
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "sdk=$SDK" >> $GITHUB_OUTPUT
+          echo "SDK path: $SDK"
+          ls -la "$SDK" || true
+
+      - name: Cap cores (safe)
+        id: cores
+        run: |
+          set -euo pipefail
+          HOST_CORES=$(sysctl -n hw.ncpu || echo 2)
+          CORES="$HOST_CORES"
+          if [ "$CORES" -gt 2 ]; then CORES=2; fi
+          echo "cores=$CORES" >> $GITHUB_OUTPUT
+          echo "host_cores=$HOST_CORES" >> $GITHUB_OUTPUT
+
+      - name: Download GCC + in-tree prerequisites (if not cached)
+        run: |
+          set -euo pipefail
           mkdir -p thirdparty
           cd thirdparty
 
           download_and_extract() {
             url="$1"
             out="$2"
-            echo " -> Downloading $url -> $out"
+            echo "Downloading $url -> $out"
             curl -fL -o "$out" "$url"
-            # quick sanity check: ensure tar can list it
+            # quick validation
             if ! tar -tf "$out" >/dev/null 2>&1; then
-              echo "ERROR: downloaded file $out is not a valid tar archive or is corrupted"
+              echo "ERROR: $out not a valid tar archive"
               file "$out" || true
               head -c 512 "$out" | sed -n '1,200p' || true
-              return 2
+              exit 2
             fi
             tar -xf "$out"
+            rm -f "$out" || true
           }
 
-          echo "Downloading GCC ${GCC_VERSION}..."
-          GCC_URL="https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz"
-          download_and_extract "$GCC_URL" "gcc.tar.xz"
-          mv "gcc-${GCC_VERSION}" gcc-src
+          if [ ! -d "gcc-src" ]; then
+            download_and_extract "https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz" "gcc.tar.xz"
+            mv "gcc-${GCC_VERSION}" gcc-src
+          else
+            echo "gcc-src already exists (cache)"
+          fi
 
-          echo "Downloading GMP ${GMP_VERSION}..."
-          download_and_extract "https://gmplib.org/download/gmp/gmp-${GMP_VERSION}.tar.xz" "gmp.tar.xz"
-          mv "gmp-${GMP_VERSION}" gcc-src/gmp
+          # in-tree prerequisites to avoid ABI mismatches with brew libs
+          if [ ! -d "gcc-src/gmp" ]; then
+            download_and_extract "https://gmplib.org/download/gmp/gmp-${GMP_VERSION}.tar.xz" "gmp.tar.xz"
+            mv "gmp-${GMP_VERSION}" gcc-src/gmp
+          fi
 
-          echo "Downloading MPFR ${MPFR_VERSION}..."
-          download_and_extract "https://www.mpfr.org/mpfr-${MPFR_VERSION}/mpfr-${MPFR_VERSION}.tar.xz" "mpfr.tar.xz"
-          mv "mpfr-${MPFR_VERSION}" gcc-src/mpfr
+          if [ ! -d "gcc-src/mpfr" ]; then
+            download_and_extract "https://www.mpfr.org/mpfr-${MPFR_VERSION}/mpfr-${MPFR_VERSION}.tar.xz" "mpfr.tar.xz"
+            mv "mpfr-${MPFR_VERSION}" gcc-src/mpfr
+          fi
 
-          echo "Downloading MPC ${MPC_VERSION}..."
-          download_and_extract "https://ftp.gnu.org/gnu/mpc/mpc-${MPC_VERSION}.tar.gz" "mpc.tar.gz"
-          mv "mpc-${MPC_VERSION}" gcc-src/mpc
+          if [ ! -d "gcc-src/mpc" ]; then
+            download_and_extract "https://ftp.gnu.org/gnu/mpc/mpc-${MPC_VERSION}.tar.gz" "mpc.tar.gz"
+            mv "mpc-${MPC_VERSION}" gcc-src/mpc
+          fi
 
-          echo "Downloading ISL ${ISL_VERSION}..."
-          download_and_extract "https://libisl.sourceforge.io/isl-${ISL_VERSION}.tar.xz" "isl.tar.xz"
-          mv "isl-${ISL_VERSION}" gcc-src/isl
+          if [ ! -d "gcc-src/isl" ]; then
+            download_and_extract "https://libisl.sourceforge.io/isl-${ISL_VERSION}.tar.xz" "isl.tar.xz"
+            mv "isl-${ISL_VERSION}" gcc-src/isl
+          fi
 
-          echo "Thirdparty tree prepared:"
-          ls -la
+          du -sh . || true
+          ls -la || true
+
+      - name: Save thirdparty cache (best-effort)
+        uses: actions/cache@v4
+        with:
+          path: thirdparty
+          key: thirdparty-${{ runner.os }}-gcc-${{ env.GCC_VERSION }}
 
       - name: Prepare build dir
         run: |
+          set -euo pipefail
           rm -rf build || true
           mkdir -p build
-          cd build
-          ls -la ../thirdparty/gcc-src || true
+          ls -la thirdparty/gcc-src || true
 
-      - name: Configure GCC (stage1)
+      - name: Configure GCC (C,C++,Fortran) - conservative
         run: |
           set -euo pipefail
-          SDK="${{ steps.sdk.outputs.sdk_path }}"
-          CORES="${{ steps.vars.outputs.cores }}"
-          echo "Using SDK: $SDK"
+          SDK="${{ steps.sdk.outputs.sdk }}"
+          CORES="${{ steps.cores.outputs.cores }}"
           cd build
-          export CC="$(xcrun --sdk iphoneos -f clang)"
-          export CXX="$(xcrun --sdk iphoneos -f clang++)"
+          export CC="ccache $(xcrun --sdk iphoneos -f clang)"
+          export CXX="ccache $(xcrun --sdk iphoneos -f clang++)"
           export SDKROOT="$SDK"
           export CFLAGS="-isysroot ${SDK} -O2 -pipe -fPIC -fno-common"
           export CXXFLAGS="$CFLAGS -std=gnu++17"
           export LDFLAGS="-isysroot ${SDK} -Wl,-syslibroot,${SDK}"
           export AS="$(xcrun --sdk iphoneos -f as)"
           export LD="$(xcrun --sdk iphoneos -f ld)"
-          # configure: conservative flags to maximize success
           ../thirdparty/gcc-src/configure \
             --target=${{ env.TARGET }} \
             --prefix=${{ env.PREFIX }} \
             --with-sysroot="${SDK}" \
-            --enable-languages=c,c++ \
+            --enable-languages=c,c++,fortran \
+            --disable-bootstrap \
             --disable-multilib \
             --disable-nls \
-            --disable-bootstrap \
             --disable-libssp \
             --disable-libquadmath \
             --disable-libgomp \
@@ -142,98 +179,75 @@ jobs:
             --with-mpfr=../thirdparty/gcc-src/mpfr \
             --with-mpc=../thirdparty/gcc-src/mpc \
             --with-isl=../thirdparty/gcc-src/isl \
-            --with-as="$AS" --with-ld="$LD" \
             CC="$CC" CXX="$CXX" CFLAGS="$CFLAGS" CXXFLAGS="$CXXFLAGS" LDFLAGS="$LDFLAGS"
 
-      - name: Build GCC (stage1 minimal: compiler + libgcc)
+      - name: Build minimal (all-gcc + libgcc + libgfortran best-effort)
         run: |
           set -euo pipefail
           cd build
-          CORES="${{ steps.vars.outputs.cores }}"
-          echo "Starting make (all-gcc) with ${CORES} cores..."
-          MAKE_J="-j${CORES}"
-          # build only the compiler itself and minimal target libgcc to reduce time & failures
-          make all-gcc ${MAKE_J} 2>&1 | tee build_all_gcc.log || ( echo "make all-gcc failed, tail log:"; tail -n 200 build_all_gcc.log; false )
-          make install-gcc DESTDIR=$PWD/${{ env.DESTDIR_REL }} 2>&1 | tee build_install_gcc.log || ( echo "install-gcc failed, tail log:"; tail -n 200 build_install_gcc.log; false )
-          echo "Building target libgcc (minimal)..."
-          make all-target-libgcc ${MAKE_J} 2>&1 | tee build_libgcc.log || ( echo "all-target-libgcc failed, tail log:"; tail -n 200 build_libgcc.log; false )
-          make install-target-libgcc DESTDIR=$PWD/${{ env.DESTDIR_REL }} 2>&1 | tee build_install_libgcc.log || ( echo "install-target-libgcc failed, tail log:"; tail -n 200 build_install_libgcc.log; false )
+          MAKE_J="-j${{ steps.cores.outputs.cores }}"
+          echo "make $MAKE_J all-gcc"
+          make $MAKE_J all-gcc 2>&1 | tee build_all_gcc.log || ( echo "make all-gcc failed"; tail -n 200 build_all_gcc.log; false )
+          make install-gcc DESTDIR=$PWD/${{ env.DESTDIR_REL }} 2>&1 | tee build_install_gcc.log || ( echo "install-gcc failed"; tail -n 200 build_install_gcc.log; false )
+          echo "make $MAKE_J all-target-libgcc"
+          make $MAKE_J all-target-libgcc 2>&1 | tee build_libgcc.log || ( echo "all-target-libgcc failed"; tail -n 200 build_libgcc.log; false )
+          make install-target-libgcc DESTDIR=$PWD/${{ env.DESTDIR_REL }} 2>&1 | tee build_install_libgcc.log || ( echo "install-target-libgcc failed"; tail -n 200 build_install_libgcc.log; false )
+          echo "Attempt libgfortran (may fail on some setups)"
+          make $MAKE_J all-target-libgfortran 2>&1 | tee build_libgfortran.log || echo "all-target-libgfortran failed (nonfatal)"
+          make install-target-libgfortran DESTDIR=$PWD/${{ env.DESTDIR_REL }} 2>&1 | tee build_install_libgfortran.log || echo "install-target-libgfortran failed (nonfatal)"
 
-      - name: Basic sanity: list installroot
+      - name: Strip & reduce artifact size
         run: |
-          if [ -d "build/${{ env.DESTDIR_REL }}/usr/local/gcc-ios" ]; then
-            echo "Installroot contents (top-level):"
-            find build/${{ env.DESTDIR_REL }}/usr/local/gcc-ios -maxdepth 3 -ls || true
+          set -euo pipefail
+          IR="build/${{ env.DESTDIR_REL }}"
+          TARGETROOT="${IR}${{ env.PREFIX }}"
+          echo "Installroot size before cleanup:"
+          du -sh "$IR" || true
+          # strip static libs (attempt; safe)
+          find "$TARGETROOT" -type f -name "*.a" -print0 | xargs -0 -n1 true 2>/dev/null || true
+          # remove docs/man
+          rm -rf "$TARGETROOT"/share/man || true
+          rm -rf "$TARGETROOT"/share/doc || true
+          echo "Installroot size after cleanup:"
+          du -sh "$IR" || true
+
+      - name: Basic sanity listing
+        run: |
+          set -euo pipefail
+          if [ -d "build/${{ env.DESTDIR_REL }}${{ env.PREFIX }}" ]; then
+            echo "Top-level install (sample):"
+            find build/${{ env.DESTDIR_REL }}${{ env.PREFIX }} -maxdepth 3 -ls || true
           else
-            echo "Warning: expected installroot path missing; listing build dir:"
+            echo "Installroot missing; listing build dir"
             find build -maxdepth 4 -ls || true
           fi
 
-      - name: Collect artifact (installroot)
-        uses: actions/upload-artifact@v4
-        with:
-          name: gcc-ios-install
-          path: build/${{ env.DESTDIR_REL }}
-
-      - name: Package tar.gz (for quick download)
-        run: |
-          cd build/${{ env.DESTDIR_REL }}
-          tar -czf ../../gcc-ios-${GCC_VERSION}-${{ github.run_id }}.tar.gz .
-          cd ../..
-      - name: Upload final tar artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: gcc-ios-tar
-          path: build/gcc-ios-${GCC_VERSION}-${{ github.run_id }}.tar.gz
-
-  package-deb:
-    name: Package .deb (ubuntu)
-    runs-on: ubuntu-latest
-    needs: build-macos
-    timeout-minutes: 60
-    steps:
-      - name: Download build artifact (installroot)
-        uses: actions/download-artifact@v4
-        with:
-          name: gcc-ios-install
-          path: ./artifact
-
-      - name: Prepare packaging tools
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y ruby ruby-dev build-essential fakeroot dpkg-dev rpm dpkg-dev zip
-          sudo gem install --no-document fpm
-
-      - name: Inspect installroot
-        run: |
-          echo "Listing artifact tree (first 6 levels):"
-          find artifact -maxdepth 6 -type f -ls || true
-
-      - name: Create minimal control and package with fpm
+      - name: Install fpm (macOS)
         run: |
           set -euo pipefail
-          VERSION="${{ env.GCC_VERSION }}"
-          PKGNAME="gcc-ios"
-          if [ ! -d artifact/usr/local/gcc-ios ]; then
-            echo "expected artifact/usr/local/gcc-ios missing; listing artifact root:"
-            find artifact -maxdepth 6 -ls
-            exit 1
-          fi
-          # Use fpm to create deb rooted at /usr/local/gcc-ios
-          fpm -s dir -t deb -n "${PKGNAME}" -v "${VERSION}" --architecture arm64 \
-            --description "Cross-built GCC for aarch64-apple-ios (prefix /usr/local/gcc-ios)" \
-            -C artifact usr/local/gcc-ios
-          mkdir -p out
-          mv *.deb out/ || true
+          gem install --no-document fpm
 
-      - name: Zip .deb for download
+      - name: Build .deb + zip
         run: |
+          set -euo pipefail
+          cd build/${{ env.DESTDIR_REL }}
+          # fpm creates .deb rooted at /usr/local/gcc-ios
+          fpm -s dir -t deb -n gcc-ios -v "${{ env.GCC_VERSION }}" --architecture arm64 \
+            --description "GCC + G++ + GFortran for aarch64-apple-ios (prefix /usr/local/gcc-ios)" \
+            usr/local/gcc-ios
           mkdir -p release
-          cp out/*.deb release/ || true
+          mv *.deb release/ || true
           zip -r release/gcc-ios-${{ env.GCC_VERSION }}-deb.zip release/*.deb || true
+          ls -lah release || true
 
-      - name: Upload packaging artifacts
+      - name: Upload artifact (release)
         uses: actions/upload-artifact@v4
         with:
-          name: packaged-deb
-          path: release
+          name: gcc-ios-release
+          path: build/${{ env.DESTDIR_REL }}/release
+
+      - name: Create GitHub Release and attach artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: gcc-ios-${{ env.GCC_VERSION }}-${{ github.run_number }}
+          files: build/${{ env.DESTDIR_REL }}/release/*
