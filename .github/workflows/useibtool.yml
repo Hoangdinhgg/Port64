@@ -1,0 +1,34 @@
+name: Compile Storyboards
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Compile storyboards
+      run: |
+        # Compile Main.storyboard
+        ibtool --compile Main.storyboardc Main.storyboard
+        # Compile LaunchScreen.storyboard
+        ibtool --compile LaunchScreen.storyboardc LaunchScreen.storyboard
+        # Tạo thư mục Base.lproj
+        mkdir -p Resources/Base.lproj
+        # Copy vào Resources
+        cp -r Main.storyboardc Resources/Base.lproj/
+        cp -r LaunchScreen.storyboardc Resources/Base.lproj/
+        # Xóa file cũ
+        rm -rf Main.storyboardc LaunchScreen.storyboardc
+        ls -la Resources/Base.lproj/
+    
+    - name: Upload
+      uses: actions/upload-artifact@v3
+      with:
+        name: storyboards
+        path: Resources/Base.lproj/
