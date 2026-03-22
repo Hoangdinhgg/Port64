@@ -18,7 +18,7 @@ on:
       sdk:
         description: "SDK to build against"
         required: true
-        default: "iphonesimulator"
+        default: "iphoneos"
 
 jobs:
   build:
@@ -38,6 +38,12 @@ jobs:
           git clone --depth 1 --branch "${{ github.event.inputs.webkit_ref }}" \
             https://github.com/WebKit/WebKit.git WebKit
 
+      - name: Clean stale build products
+        run: |
+          set -euxo pipefail
+          rm -rf WebKit/WebKitBuild || true
+          rm -rf "$HOME/Library/Developer/Xcode/DerivedData" || true
+
       - name: Show workspace schemes
         working-directory: WebKit
         run: |
@@ -55,10 +61,10 @@ jobs:
           set -euxo pipefail
 
           RUNNER_ARCH="$(uname -m)"
-          if [ "$RUNNER_ARCH" = "arm64" ]; then
+          if [ "$SDK" = "iphoneos" ]; then
             BUILD_ARCH="arm64"
           else
-            BUILD_ARCH="x86_64"
+            BUILD_ARCH="$RUNNER_ARCH"
           fi
 
           OUTDIR="$OUTROOT/$COMPONENT"
@@ -72,11 +78,13 @@ jobs:
             -derivedDataPath "$OUTDIR/DerivedData" \
             ONLY_ACTIVE_ARCH=YES \
             ARCHS="$BUILD_ARCH" \
+            CLANG_CXX_LANGUAGE_STANDARD=c++20 \
+            -parallelizeTargets NO \
+            -jobs 1 \
             build
 
-          # Collect whatever got produced for later inspection.
-          if [ -d "$OUTDIR/DerivedData/Build/Products/$CONFIGURATION-iphonesimulator" ]; then
-            cp -R "$OUTDIR/DerivedData/Build/Products/$CONFIGURATION-iphonesimulator" "$OUTDIR/Artifacts/" || true
+          if [ -d "$OUTDIR/DerivedData/Build/Products/$CONFIGURATION-$SDK" ]; then
+            cp -R "$OUTDIR/DerivedData/Build/Products/$CONFIGURATION-$SDK" "$OUTDIR/Artifacts/" || true
           fi
 
       - name: Upload artifact
