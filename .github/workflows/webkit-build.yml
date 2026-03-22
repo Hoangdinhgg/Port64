@@ -1,0 +1,74 @@
+name: Build WebKit One Component
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: "Scheme name to build one at a time"
+        required: true
+        default: "JavaScriptCore"
+      webkit_ref:
+        description: "WebKit branch/tag/ref"
+        required: true
+        default: "main"
+      configuration:
+        description: "Xcode build configuration"
+        required: true
+        default: "Release"
+      sdk:
+        description: "SDK to build against"
+        required: true
+        default: "iphonesimulator"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout this workflow repo
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Clone WebKit source
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "${{ github.event.inputs.webkit_ref }}" \
+            https://github.com/WebKit/WebKit.git WebKit
+
+      - name: Show workspace schemes
+        working-directory: WebKit
+        run: |
+          set -euxo pipefail
+          xcodebuild -list -workspace WebKit.xcworkspace
+
+      - name: Build one component only
+        working-directory: WebKit
+        env:
+          COMPONENT: ${{ github.event.inputs.component }}
+          CONFIGURATION: ${{ github.event.inputs.configuration }}
+          SDK: ${{ github.event.inputs.sdk }}
+          OUTROOT: ${{ github.workspace }}/build-out
+        run: |
+          set -euxo pipefail
+
+          OUTDIR="$OUTROOT/$COMPONENT"
+          mkdir -p "$OUTDIR/SYMROOT" "$OUTDIR/DSTROOT"
+
+          xcodebuild \
+            -workspace WebKit.xcworkspace \
+            -scheme "$COMPONENT" \
+            -configuration "$CONFIGURATION" \
+            -sdk "$SDK" \
+            SYMROOT="$OUTDIR/SYMROOT" \
+            DSTROOT="$OUTDIR/DSTROOT" \
+            build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webkit-${{ github.event.inputs.component }}-${{ github.event.inputs.sdk }}
+          path: build-out/${{ github.event.inputs.component }}/
+          retention-days: 7
